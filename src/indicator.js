@@ -33,6 +33,7 @@ import UPower from "gi://UPowerGlib";
 import {gettext as _} from "resource:///org/gnome/shell/extensions/extension.js";
 import * as PopupMenu from "resource:///org/gnome/shell/ui/popupMenu.js";
 import * as Util from "resource:///org/gnome/shell/misc/util.js";
+import {loadInterfaceXML} from "resource:///org/gnome/shell/misc/fileUtils.js";
 
 import * as utils from "./utils.js";
 import {Cpufreqctl} from "./utils.js";
@@ -43,6 +44,16 @@ import {Slider2} from "./slider2.js";
 import {getExtensionPath} from "./extensionContext.js";
 
 const LASTSETTINGS = `${GLib.get_user_cache_dir()}/cpupower.last-settings`;
+
+const UPowerBusName = "org.freedesktop.UPower";
+const UPowerDisplayDevicePath = "/org/freedesktop/UPower/devices/DisplayDevice";
+
+// Plain D-Bus proxy for the composite display device, mirroring what gnome-shell
+// itself uses for its power indicator (js/ui/status/system.js). Talking to UPower
+// over D-Bus avoids libupower-glib's GObject bindings, which are unsafe to use
+// from GJS (see the comment in enable()).
+const UPowerDeviceInterface = loadInterfaceXML("org.freedesktop.UPower.Device");
+const UPowerDeviceProxy = Gio.DBusProxy.makeProxyWrapper(UPowerDeviceInterface);
 
 export class CPUFreqIndicator extends CPUFreqBaseIndicator {
     constructor(onConstructed) {
@@ -100,10 +111,19 @@ export class CPUFreqIndicator extends CPUFreqBaseIndicator {
     }
 
     enable() {
-        this.powerClient = new UPower.Client();
-        this.powerDevice = this.powerClient.get_display_device();
-        this.powerState = this.powerDevice.state;
-        this.powerConnectSignalId = this.powerDevice.connect("notify::state", this.onPowerChanged.bind(this));
+        // Do not use libupower-glib's UpClient here. `new UPower.Client()` is
+        // constructed without running up_client_initable_init(), so the object's
+        // priv pointer stays NULL; up_client_finalize() then dereferences it and
+        // segfaults the shell as soon as the object is garbage collected (which
+        // happens whenever the shell disables/re-enables extensions, e.g. on
+        // lock/unlock). Query the display device over D-Bus instead.
+        this.powerDevice = new UPowerDeviceProxy(
+            Gio.DBus.system,
+            UPowerBusName,
+            UPowerDisplayDevicePath);
+
+        this.powerState = this.powerDevice.State;
+        this.powerConnectSignalId = this.powerDevice.connect("g-properties-changed", this.onPowerChanged.bind(this));
 
         // select the right profile at login
         this.powerActions(this.powerState, null);
@@ -115,7 +135,7 @@ export class CPUFreqIndicator extends CPUFreqBaseIndicator {
     }
 
     onPowerChanged() {
-        let newState = this.powerDevice.state;
+        let newState = this.powerDevice.State;
 
         if (newState !== this.powerState) {
             this.powerActions(newState, null);
@@ -348,7 +368,6 @@ export class CPUFreqIndicator extends CPUFreqBaseIndicator {
             this.powerConnectSignalId = 0;
         }
         this.powerDevice = null;
-        this.powerClient = null;
 
         super.disable();
 
